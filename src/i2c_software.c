@@ -62,8 +62,9 @@ static uint8_t
 i2c_software_read_ack(struct i2c_software *is, uint_fast8_t state)
 {
     uint8_t nack = 0;
-    if (state == 0)
-        gpio_in_reset(is->sda_in, 1);
+    // Always configure SDA as input before reading ACK
+    // This fixes the "read n-1 data bug" where SDA might be in output mode
+    gpio_in_reset(is->sda_in, 1);
     i2c_delay(is->ticks);
     gpio_in_reset(is->scl_in, 1);
     nack = gpio_in_read(is->sda_in);
@@ -186,6 +187,7 @@ i2c_software_read(struct i2c_software *is, uint8_t reg_len, uint8_t *reg
         ret = I2C_BUS_START_READ_NACK;
         goto out;
     }
+	//fix read n-1 data bug
     while(read_len--) {
         *read = i2c_software_read_byte(is, read_len);
         read++;

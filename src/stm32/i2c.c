@@ -1,10 +1,11 @@
-// I2C functions on stm32
+// I2C functions for STM32 / N32G455
 //
 // Copyright (C) 2019  Kevin O'Connor <kevin@koconnor.net>
+// N32G455 adaptation by user
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
-#include "autoconf.h" // CONFIG_MACH_STM32F1
+#include "autoconf.h" // CONFIG_MACH_STM32F1, CONFIG_MACH_N32G455
 #include "board/misc.h" // timer_is_before
 #include "command.h" // shutdown
 #include "gpio.h" // i2c_setup
@@ -52,10 +53,27 @@ static const struct i2c_info i2c_bus[] = {
 };
 
 // Work around stm32 errata causing busy bit to be stuck
+// For N32G455, this function performs software reset and GPIO pre-charge
 static void
-i2c_busy_errata(uint8_t scl_pin, uint8_t sda_pin)
+i2c_busy_errata(I2C_TypeDef *i2c, uint8_t scl_pin, uint8_t sda_pin)
 {
-    if (! CONFIG_MACH_STM32F1)
+#ifdef CONFIG_MACH_N32G455
+    // N32G455 specific: software reset + GPIO pre-charge
+    i2c->CR1 |= I2C_CR1_SWRST;
+    udelay(10);
+    i2c->CR1 &= ~I2C_CR1_SWRST;
+    uint32_t timeout = 10000;
+    while ((i2c->SR2 & I2C_SR2_BUSY) && --timeout)
+        udelay(1);
+
+    // Temporarily set SCL and SDA as push-pull outputs and drive high
+
+	gpio_out_setup(scl_pin,1);
+	gpio_out_setup(sda_pin,1);
+    udelay(5);
+#else
+    // STM32 original errata workaround
+    if (!CONFIG_MACH_STM32F1)
         return;
     gpio_peripheral(scl_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
     gpio_peripheral(sda_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
@@ -63,6 +81,7 @@ i2c_busy_errata(uint8_t scl_pin, uint8_t sda_pin)
     gpio_peripheral(scl_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, -1);
     gpio_peripheral(scl_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
     gpio_peripheral(sda_pin, GPIO_OUTPUT | GPIO_OPEN_DRAIN, 1);
+#endif
 }
 
 struct i2c_config
@@ -77,17 +96,32 @@ i2c_setup(uint32_t bus, uint32_t rate, uint8_t addr)
     if (!is_enabled_pclock((uint32_t)i2c)) {
         // Enable i2c clock and gpio
         enable_pclock((uint32_t)i2c);
-        i2c_busy_errata(ii->scl_pin, ii->sda_pin);
+        i2c_busy_errata(i2c, ii->scl_pin, ii->sda_pin);
         gpio_peripheral(ii->scl_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
         gpio_peripheral(ii->sda_pin, GPIO_FUNCTION(4) | GPIO_OPEN_DRAIN, 1);
-        i2c->CR1 = I2C_CR1_SWRST;
-        i2c->CR1 = 0;
 
-        // Set 100Khz frequency and enable
+#ifdef CONFIG_MACH_N32G455
+        // For N32, perform another software reset to ensure clean state after GPIO config
+        i2c->CR1 |= I2C_CR1_SWRST;
+        udelay(10);
+        i2c->CR1 &= ~I2C_CR1_SWRST;
+        // Wait for BUSY again (optional)
+        uint32_t timeout = 10000;
+        while ((i2c->SR2 & I2C_SR2_BUSY) && --timeout)
+            udelay(1);
+#endif
+
+        // Disable I2C before configuration
+        i2c->CR1 &= ~I2C_CR1_PE;
+
+        // Set clock frequency based on APB clock
         uint32_t pclk = get_pclock_frequency((uint32_t)i2c);
-        i2c->CR2 = pclk / 1000000;
+        i2c->CR2 = pclk / 1000000;   // 1|¨¬s tick
+        // Assume standard mode 100kHz; fast mode could be added but not used by LDC1612
         i2c->CCR = pclk / 100000 / 2;
         i2c->TRISE = (pclk / 1000000) + 1;
+
+        // Enable I2C
         i2c->CR1 = I2C_CR1_PE;
     }
 

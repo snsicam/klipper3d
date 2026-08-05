@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, select, math, time, logging, queue
+import os, gc, select, math, time, logging, queue
 import greenlet
 import chelper, util
 
@@ -15,7 +15,7 @@ class ReactorError(Exception):
 
 class ReactorTimer:
     def __init__(self, callback, waketime):
-        self.callback = self.underlying_callback = callback
+        self.callback = callback
         self.waketime = waketime
         self.timer_is_running = False
 
@@ -45,7 +45,6 @@ class ReactorCallback:
     def __init__(self, reactor, callback, waketime):
         self.reactor = reactor
         self.timer = reactor.register_timer(self.invoke, waketime)
-        self.timer.underlying_callback = callback
         self.callback = callback
         self.completion = ReactorCompletion(reactor)
     def invoke(self, eventtime):
@@ -105,16 +104,16 @@ class ReactorPreventPause:
 class SelectReactor:
     NOW = _NOW
     NEVER = _NEVER
-    def __init__(self):
+    def __init__(self, gc_checking=False):
         # Main code
         self._process = False
         self.monotonic = chelper.get_ffi()[1].get_monotonic
+        # Python garbage collection
+        self._gc_checking = gc_checking
+        self._last_gc_times = [0., 0., 0.]
         # Timers
         self._timers = []
         self._next_timer = self.NEVER
-        # Idle notifier callback
-        self._start_busy_time = 0.
-        self._idle_callback = (lambda e, sbt: False)
         # Callbacks
         self._pipe_fds = None
         self._async_queue = queue.Queue()
@@ -131,11 +130,24 @@ class SelectReactor:
         self._cached_dispatch_greenlets = []
         self._all_greenlets = []
         self._prevent_pause_count = 0
-        # Tracking of high latency
-        self._latency_warning = self.NEVER
-        self._latency_callback = (lambda e, pe, rc: None)
-        self._recent_eventtime = 0.
-        self._recent_callbacks = []
+    # Python garbage collection
+    def get_gc_stats(self):
+        return tuple(self._last_gc_times)
+    def _check_gc(self, eventtime):
+        if not self._gc_checking:
+            return False
+        gi = gc.get_count()
+        if gi[0] < 700:
+            return False
+        # Reactor looks idle and gc is due - run it
+        gc_level = 0
+        if gi[1] >= 10:
+            gc_level = 1
+            if gi[2] >= 10:
+                gc_level = 2
+        self._last_gc_times[gc_level] = eventtime
+        gc.collect(gc_level)
+        return True
     # Timers
     def update_timer(self, timer_handler, waketime):
         if timer_handler.timer_is_running:
@@ -154,7 +166,14 @@ class SelectReactor:
         timers = list(self._timers)
         timers.pop(timers.index(timer_handler))
         self._timers = timers
-    def _check_timers(self, eventtime):
+    def _check_timers(self, eventtime, busy):
+        if eventtime < self._next_timer:
+            if busy:
+                return 0.
+            gc_busy = self._check_gc(eventtime)
+            if gc_busy:
+                return 0.
+            return min(1., max(.001, self._next_timer - eventtime))
         self._next_timer = self.NEVER
         g_dispatch = self._g_dispatch
         for t in self._timers:
@@ -162,25 +181,14 @@ class SelectReactor:
             if eventtime >= waketime:
                 t.waketime = self.NEVER
                 t.timer_is_running = True
-                self._recent_callbacks.append(t.underlying_callback)
                 t.waketime = waketime = t.callback(eventtime)
                 t.timer_is_running = False
                 if g_dispatch is not self._g_dispatch:
                     self._next_timer = min(self._next_timer, waketime)
                     self._end_greenlet(g_dispatch)
-                    return
+                    return 0.
             self._next_timer = min(self._next_timer, waketime)
-    # Idle notifiers
-    def set_idle_notifier(self, callback):
-        self._idle_callback = callback
-    def _calc_sleep_time(self, eventtime):
-        self._recent_callbacks.append(self._idle_callback)
-        self._prevent_pause_count += 1
-        busy = self._idle_callback(eventtime, self._start_busy_time)
-        self._prevent_pause_count -= 1
-        if busy:
-            return 0.
-        return min(1., max(.001, self._next_timer - eventtime))
+        return 0.
     # Callbacks and Completions
     def completion(self):
         return ReactorCompletion(self)
@@ -238,8 +246,6 @@ class SelectReactor:
             return self._g_dispatch.switch(waketime)
         # Pausing the dispatch greenlet - setup timer to resume this greenlet
         g.timer = self.register_timer(g.switch, waketime)
-        if self._recent_callbacks:
-            g.timer.underlying_callback = self._recent_callbacks[-1]
         self._next_timer = self.NOW
         if self._cached_dispatch_greenlets:
             # Switch to _end_greenlet to activate cached dispatch greenlet
@@ -291,77 +297,40 @@ class SelectReactor:
                 self._write_fds.remove(fd)
         elif is_writeable:
             self._write_fds.append(fd)
-    def _check_fd_activity(self, timeout):
-        res = select.select(self._read_fds, self._write_fds, [], timeout)
-        return ([(fd, self._READ) for fd in res[0]]
-                + [(fd, self._WRITE) for fd in res[1]])
-    def _dispatch_fd_events(self, eventtime, hdls):
+    def _check_fds(self, eventtime, hdls):
         g_dispatch = self._g_dispatch
         for fd, event in hdls:
             hdl = self._fds.get(fd, self._dummy_fd_hdl)
             if event & self._READ:
-                self._recent_callbacks.append(hdl.read_callback)
                 hdl.read_callback(eventtime)
                 if g_dispatch is not self._g_dispatch:
                     self._end_greenlet(g_dispatch)
-                    return True
+                    return self.monotonic()
             if event & self._WRITE:
-                self._recent_callbacks.append(hdl.write_callback)
                 hdl.write_callback(eventtime)
                 if g_dispatch is not self._g_dispatch:
                     self._end_greenlet(g_dispatch)
-                    return True
-        return False
-    # High latency checking
-    def set_latency_notifier(self, latency, latency_callback):
-        self._latency_warning = latency
-        self._latency_callback = latency_callback
-    def _dispatch_latency_callback(self, eventtime, prev_eventtime):
-        prev_cbs = self._recent_callbacks
-        self._recent_callbacks = [self._latency_callback]
-        self._prevent_pause_count += 1
-        self._latency_callback(eventtime, prev_eventtime, prev_cbs)
-        self._prevent_pause_count -= 1
+                    return self.monotonic()
+        return eventtime
     # Main loop
     def _dispatch_loop(self):
-        eventtime = 0.
         busy = True
+        eventtime = self.monotonic()
         while self._process:
-            # Check if can sleep
-            timeout = 0.
-            if not busy:
-                timeout = self._calc_sleep_time(eventtime)
-            # Check for file activity
-            hdls = self._check_fd_activity(timeout)
-            eventtime = self.monotonic()
-            if timeout:
-                self._start_busy_time = eventtime
+            timeout = self._check_timers(eventtime, busy)
             busy = False
-            # Check for high latency
-            prev_etime = self._recent_eventtime
-            self._recent_eventtime = eventtime
-            if not timeout and eventtime - prev_etime >= self._latency_warning:
+            res = select.select(self._read_fds, self._write_fds, [], timeout)
+            eventtime = self.monotonic()
+            if res[0] or res[1]:
                 busy = True
-                self._dispatch_latency_callback(eventtime, prev_etime)
-            else:
-                del self._recent_callbacks[:]
-            # Dispatch file events
-            if hdls:
-                busy = True
-                did_switch = self._dispatch_fd_events(eventtime, hdls)
-                if did_switch:
-                    continue
-            # Dispatch pending timers
-            if eventtime >= self._next_timer:
-                busy = True
-                self._check_timers(eventtime)
+                hdls = ([(fd, self._READ) for fd in res[0]]
+                        + [(fd, self._WRITE) for fd in res[1]])
+                eventtime = self._check_fds(eventtime, hdls)
     def run(self):
         if self._pipe_fds is None:
             self._setup_async_callbacks()
         self._process = True
         self._prevent_pause_count = 0
-        self._recent_eventtime = self._start_busy_time = self.monotonic()
-        self._recent_callbacks = []
         try:
             while self._process:
                 # Create new greenlet to dispatch timers and events
@@ -372,7 +341,6 @@ class SelectReactor:
                 # Control returns here on end() request or switch from pause()
         finally:
             self._g_dispatch = None
-        self._recent_callbacks = []
     def end(self):
         self._process = False
     def finalize(self):
@@ -390,8 +358,8 @@ class SelectReactor:
             self._pipe_fds = None
 
 class PollReactor(SelectReactor):
-    def __init__(self):
-        SelectReactor.__init__(self)
+    def __init__(self, gc_checking=False):
+        SelectReactor.__init__(self, gc_checking)
         self._poll = select.poll()
         self._READ = select.POLLIN | select.POLLHUP
         self._WRITE = select.POLLOUT
@@ -411,12 +379,22 @@ class PollReactor(SelectReactor):
         if is_writeable:
             flags |= select.POLLOUT
         self._poll.modify(file_handler.fd, flags)
-    def _check_fd_activity(self, timeout):
-        return self._poll.poll(int(math.ceil(timeout * 1000.)))
+    # Main loop
+    def _dispatch_loop(self):
+        busy = True
+        eventtime = self.monotonic()
+        while self._process:
+            timeout = self._check_timers(eventtime, busy)
+            busy = False
+            res = self._poll.poll(int(math.ceil(timeout * 1000.)))
+            eventtime = self.monotonic()
+            if res:
+                busy = True
+                eventtime = self._check_fds(eventtime, res)
 
 class EPollReactor(SelectReactor):
-    def __init__(self):
-        SelectReactor.__init__(self)
+    def __init__(self, gc_checking=False):
+        SelectReactor.__init__(self, gc_checking)
         self._epoll = select.epoll()
         self._READ = select.EPOLLIN | select.EPOLLHUP
         self._WRITE = select.EPOLLOUT
@@ -436,8 +414,18 @@ class EPollReactor(SelectReactor):
         if is_writeable:
             flags |= select.EPOLLOUT
         self._epoll.modify(file_handler.fd, flags)
-    def _check_fd_activity(self, timeout):
-        return self._epoll.poll(timeout)
+    # Main loop
+    def _dispatch_loop(self):
+        busy = True
+        eventtime = self.monotonic()
+        while self._process:
+            timeout = self._check_timers(eventtime, busy)
+            busy = False
+            res = self._epoll.poll(timeout)
+            eventtime = self.monotonic()
+            if res:
+                busy = True
+                eventtime = self._check_fds(eventtime, res)
 
 # Use the poll based reactor if it is available
 try:

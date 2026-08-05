@@ -18,8 +18,21 @@ LD=$(CROSS_PREFIX)ld
 OBJCOPY=$(CROSS_PREFIX)objcopy
 OBJDUMP=$(CROSS_PREFIX)objdump
 STRIP=$(CROSS_PREFIX)strip
-CPP=cpp
+CPP=$(CROSS_PREFIX)cpp
 PYTHON=python3
+
+# Show build tools info (always displayed)
+$(info )
+$(info Build tools used by this make:)
+$(info   CC       = $(CC)       -> $(shell which $(CC) 2>/dev/null || echo "not found"))
+$(info   AS       = $(AS)       -> $(shell which $(AS) 2>/dev/null || echo "not found"))
+$(info   LD       = $(LD)       -> $(shell which $(LD) 2>/dev/null || echo "not found"))
+$(info   OBJCOPY  = $(OBJCOPY)  -> $(shell which $(OBJCOPY) 2>/dev/null || echo "not found"))
+$(info   OBJDUMP  = $(OBJDUMP)  -> $(shell which $(OBJDUMP) 2>/dev/null || echo "not found"))
+$(info   STRIP    = $(STRIP)    -> $(shell which $(STRIP) 2>/dev/null || echo "not found"))
+$(info   CPP      = $(CPP)      -> $(shell which $(CPP) 2>/dev/null || echo "not found"))
+$(info   PYTHON   = $(PYTHON)   -> $(shell which $(PYTHON) 2>/dev/null || echo "not found"))
+$(info )
 
 # Source files
 src-y =
@@ -33,7 +46,7 @@ CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
 		-std=gnu11 -O2 -MD -Wall \
 		-Wold-style-definition $(call cc-option,$(CC),-Wtype-limits,) \
     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
-CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
+CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin 
 
 OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
 OBJS_klipper.elf += $(OUT)compile_time_request.o
@@ -119,7 +132,7 @@ menuconfig:
 ################ Generic rules
 
 # Make definitions
-.PHONY : all clean distclean olddefconfig menuconfig create-board-link FORCE
+.PHONY : all clean distclean olddefconfig menuconfig create-board-link show-tools FORCE
 .DELETE_ON_ERROR:
 
 all: $(target-y)
@@ -129,5 +142,30 @@ clean:
 
 distclean: clean
 	$(Q)rm -f .config .config.old
+
+# Show tools manually (without building)
+show-tools:
+	@echo "Compiler:    $(CC) -> $$(which $(CC) 2>/dev/null || echo 'not found')"
+	@echo "Assembler:   $(AS) -> $$(which $(AS) 2>/dev/null || echo 'not found')"
+	@echo "Linker:      $(LD) -> $$(which $(LD) 2>/dev/null || echo 'not found')"
+	@echo "Objcopy:     $(OBJCOPY) -> $$(which $(OBJCOPY) 2>/dev/null || echo 'not found')"
+	@echo "Objdump:     $(OBJDUMP) -> $$(which $(OBJDUMP) 2>/dev/null || echo 'not found')"
+	@echo "Strip:       $(STRIP) -> $$(which $(STRIP) 2>/dev/null || echo 'not found')"
+	@echo "CPP:         $(CPP) -> $$(which $(CPP) 2>/dev/null || echo 'not found')"
+	@echo "Python:      $(PYTHON) -> $$(which $(PYTHON) 2>/dev/null || echo 'not found')"
+
+################ Host library (c_helper.so) for klippy
+# lib 目标：构建 c_helper.so
+.PHONY: lib
+lib: $(OUT)klippy/chelper/c_helper.so
+
+# 编译规则：将 klippy/chelper/ 下的所有 .c 文件编译成一个共享库
+$(OUT)klippy/chelper/c_helper.so: $(wildcard klippy/chelper/*.c)
+	@echo "  Building $@"
+	$(Q)mkdir -p $(@D)
+	$(Q)$(RM) -f $@
+	$(Q)cd $(@D) && $(CC) $(CFLAGS) -Wall -shared -fPIC \
+		-o c_helper.so $(abspath $^) $(LDFLAGS) 
+	$(Q)cp -rf $@ klippy/chelper/c_helper.so
 
 -include $(OUT)*.d $(patsubst %,$(OUT)%/*.d,$(dirs-y))

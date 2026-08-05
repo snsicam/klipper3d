@@ -1,9 +1,9 @@
 # Support for reading frequency samples from ldc1612
 #
-# Copyright (C) 2020-2026  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2020-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, math
+import logging
 from . import bus, bulk_sensor
 
 MIN_MSG_TIME = 0.100
@@ -76,10 +76,9 @@ class DriveCurrentCalibrate:
 class LDC1612:
     def __init__(self, config, calibration=None):
         self.printer = config.get_printer()
-        self.name = config.get_name().split()[-1]
         self.calibration = calibration
         self.dccal = DriveCurrentCalibrate(config, self)
-        self.data_rate = 400
+        self.data_rate = 500
         # Setup mcu sensor_ldc1612 bulk query code
         self.i2c = bus.MCU_I2C_from_config(config,
                                            default_addr=LDC1612_ADDR,
@@ -90,18 +89,10 @@ class LDC1612:
         self.query_ldc1612_cmd = None
         self.clock_freq = config.getint("frequency", DEFAULT_LDC1612_FREQ,
                                         2000000, 40000000)
-        # Determine sensor divider (want 4*max_hz < clock_ref)
-        max_hz = config.getfloat("max_sensor_hz", 5000000., 3000000., 20000000.)
-        self.sensor_div = int(math.ceil(4. * max_hz / self.clock_freq))
+        # Coil frequency divider, assume 12MHz is BTT Eddy
+        # BTT Eddy's coil frequency is > 1/4 of reference clock
+        self.sensor_div = 1 if self.clock_freq != DEFAULT_LDC1612_FREQ else 2
         self.freq_conv = float(self.clock_freq * self.sensor_div) / (1<<28)
-        if self.calibration is not None:
-            cal_freqs, cal_zpos = self.calibration.get_calibration()
-            if cal_freqs and max(cal_freqs) > max_hz:
-                pconfig = self.printer.lookup_object("configfile")
-                pconfig.runtime_warning(
-                    "ldc1612 %s: Should set 'max_sensor_hz' to at least %d"
-                    % (self.name, math.ceil(max(cal_freqs))))
-        # Configure intb and mcu object
         if config.get('intb_pin', None) is not None:
             ppins = config.get_printer().lookup_object("pins")
             pin_params = ppins.lookup_pin(config.get('intb_pin'))
@@ -124,6 +115,7 @@ class LDC1612:
         self.batch_bulk = bulk_sensor.BatchBulkHelper(
             self.printer, self._process_batch,
             self._start_measurements, self._finish_measurements, BATCH_UPDATES)
+        self.name = config.get_name().split()[-1]
         hdr = ('time', 'frequency', 'z')
         self.batch_bulk.add_mux_endpoint("ldc1612/dump_ldc1612", "sensor",
                                          self.name, {'header': hdr})

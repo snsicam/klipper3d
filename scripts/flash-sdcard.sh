@@ -11,7 +11,6 @@ KLIPPER_DICT_DEFAULT="${SRCDIR}/out/klipper.dict"
 SPI_FLASH="${SRCDIR}/scripts/spi_flash/spi_flash.py"
 BAUD_ARG=""
 CHECK_ARG=""
-SPI_SPEED_ARG=""
 # Force script to exit if an error occurs
 set -e
 
@@ -19,7 +18,7 @@ print_help_message()
 {
     echo "SD Card upload utility for Klipper"
     echo
-    echo "usage: flash_sdcard.sh [-h] [-l] [-c] [-s] [-b <baud>] [-f <firmware>] [-d <dictionary>]"
+    echo "usage: flash_sdcard.sh [-h] [-l] [-c] [-b <baud>] [-f <firmware>] [-d <dictionary>]"
     echo "                       <device> <board>"
     echo
     echo "positional arguments:"
@@ -30,14 +29,13 @@ print_help_message()
     echo "  -h                show this message"
     echo "  -l                list available boards"
     echo "  -c                run flash check/verify only (skip upload)"
-    echo "  -s                use fast SPI speed (4MHz)"
     echo "  -b <baud>         serial baud rate (default is 250000)"
     echo "  -f <firmware>     path to klipper.bin"
     echo "  -d <dictionary>   path to klipper.dict for firmware validation"
 }
 
 # Parse command line "optional args"
-while getopts "hlcsb:f:d:" arg; do
+while getopts "hlcb:f:d:" arg; do
     case $arg in
         h)
             print_help_message
@@ -48,7 +46,6 @@ while getopts "hlcsb:f:d:" arg; do
             exit 0
             ;;
         c) CHECK_ARG="-c";;
-        s) SPI_SPEED_ARG="-s";;
         b) BAUD_ARG="-b ${OPTARG}";;
         f) KLIPPER_BIN=$OPTARG;;
         d) KLIPPER_DICT=$OPTARG;;
@@ -88,4 +85,4 @@ fi
 
 # Run Script
 echo "Flashing ${KLIPPER_BIN} to ${DEVICE}"
-${KLIPPY_ENV} ${SPI_FLASH} ${CHECK_ARG} ${SPI_SPEED_ARG} ${BAUD_ARG} ${KLIPPER_DICT} ${DEVICE} ${BOARD} ${KLIPPER_BIN}
+${KLIPPY_ENV} ${SPI_FLASH} ${CHECK_ARG} ${BAUD_ARG} ${KLIPPER_DICT} ${DEVICE} ${BOARD} ${KLIPPER_BIN}

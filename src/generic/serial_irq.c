@@ -100,8 +100,9 @@ console_sendf(const struct command_encoder *ce, va_list args)
         writeb(&transmit_max, 0);
         writeb(&transmit_pos, 0);
     }
-    if (tmax + READP(ce->max_size) > sizeof(transmit_buf)) {
-        if (tmax - tpos + READP(ce->min_size) > sizeof(transmit_buf))
+    uint_fast8_t max_size = READP(ce->max_size);
+    if (tmax + max_size > sizeof(transmit_buf)) {
+        if (tmax + max_size - tpos > sizeof(transmit_buf))
             // Not enough space for message
             return;
         // Disable TX irq and move buffer
@@ -116,10 +117,7 @@ console_sendf(const struct command_encoder *ce, va_list args)
 
     // Generate message
     uint8_t *buf = &transmit_buf[tmax];
-    uint_fast8_t msglen = command_encode_and_frame(
-        buf, sizeof(transmit_buf) - tmax, ce, args);
-    if (!msglen)
-        return;
+    uint_fast8_t msglen = command_encode_and_frame(buf, ce, args);
 
     // Start message transmit
     writeb(&transmit_max, tmax + msglen);

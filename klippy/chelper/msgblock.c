@@ -184,20 +184,15 @@ message_queue_free(struct list_head *root)
 
 
 /****************************************************************
- * Clock conversion from 32bit to 64bit
+ * Clock estimation
  ****************************************************************/
 
 // Extend a 32bit clock value to its full 64bit value
 uint64_t
-clock_from_clock32(uint64_t last_clock, uint32_t clock32)
+clock_from_clock32(struct clock_estimate *ce, uint32_t clock32)
 {
-    return last_clock + (int32_t)(clock32 - last_clock);
+    return ce->last_clock + (int32_t)(clock32 - ce->last_clock);
 }
-
-
-/****************************************************************
- * Clock estimation
- ****************************************************************/
 
 // Convert a clock to its estimated time
 double
@@ -216,9 +211,10 @@ clock_from_time(struct clock_estimate *ce, double time)
 // Fill the fields of a 'struct clock_estimate'
 void
 clock_fill(struct clock_estimate *ce, double est_freq, double conv_time
-           , uint64_t conv_clock)
+           , uint64_t conv_clock, uint64_t last_clock)
 {
     ce->est_freq = est_freq;
     ce->conv_time = conv_time;
     ce->conv_clock = conv_clock;
+    ce->last_clock = last_clock;
 }

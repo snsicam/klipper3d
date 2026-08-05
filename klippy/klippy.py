@@ -1,7 +1,7 @@
 #!/usr/bin/env python2
 # Main code for host side printer firmware
 #
-# Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
+# Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import sys, os, gc, optparse, logging, time, collections, importlib
@@ -309,11 +309,8 @@ def main():
     logging.info("Starting Klippy...")
     git_info = util.get_git_version()
     git_vers = git_info["version"]
-    repo = os.path.join(os.path.dirname(__file__), '..')
     extra_files = [fname for code, fname in git_info["file_status"]
-                   if (code in ('??', '!!')
-                       and (fname.endswith('.py')
-                            or os.path.islink(os.path.join(repo, fname)))
+                   if (code in ('??', '!!') and fname.endswith('.py')
                        and (fname.startswith('klippy/kinematics/')
                             or fname.startswith('klippy/extras/')))]
     modified_files = [fname for code, fname in git_info["file_status"]
@@ -349,6 +346,7 @@ def main():
     elif not options.debugoutput:
         logging.warning("No log file specified!"
                         " Severe timing issues may result!")
+    gc.disable()
 
     # Start Printer() class
     while 1:
@@ -356,7 +354,7 @@ def main():
             bglogger.clear_rollover_info()
             bglogger.set_rollover_info('versions', versions)
         gc.collect()
-        main_reactor = reactor.Reactor()
+        main_reactor = reactor.Reactor(gc_checking=True)
         printer = Printer(main_reactor, bglogger, start_args)
         res = printer.run()
         if res in ['exit', 'error_exit']:

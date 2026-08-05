@@ -4,7 +4,6 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
-import mathutil
 from . import manual_probe
 
 KELVIN_TO_CELSIUS = -273.15
@@ -12,6 +11,16 @@ KELVIN_TO_CELSIUS = -273.15
 ######################################################################
 # Polynomial Helper Classes and Functions
 ######################################################################
+
+def calc_determinant(matrix):
+    m = matrix
+    aei = m[0][0] * m[1][1] * m[2][2]
+    bfg = m[1][0] * m[2][1] * m[0][2]
+    cdh = m[2][0] * m[0][1] * m[1][2]
+    ceg = m[2][0] * m[1][1] * m[0][2]
+    bdi = m[1][0] * m[0][1] * m[2][2]
+    afh = m[0][0] * m[2][1] * m[1][2]
+    return aei + bfg + cdh - ceg - bdi - afh
 
 class Polynomial2d:
     def __init__(self, a, b, c):
@@ -47,14 +56,30 @@ class Polynomial2d:
 
     @classmethod
     def fit(cls, coords):
-        # Find best fit for: a + b*x + c*x*x = y
-        eqs = []
-        ans = []
-        for x, y in coords:
-            eqs.append([1., x, x*x])
-            ans.append([y])
-        res = mathutil.solve_linear_equations(eqs, ans)
-        return cls(res[0][0], res[1][0], res[2][0])
+        xlist = [c[0] for c in coords]
+        ylist = [c[1] for c in coords]
+        count = len(coords)
+        sum_x = sum(xlist)
+        sum_y = sum(ylist)
+        sum_x2 = sum([x**2 for x in xlist])
+        sum_x3 = sum([x**3 for x in xlist])
+        sum_x4 = sum([x**4 for x in xlist])
+        sum_xy = sum([x * y for x, y in coords])
+        sum_x2y = sum([y*x**2 for x, y in coords])
+        vector_b = [sum_y, sum_xy, sum_x2y]
+        m = [
+            [count, sum_x, sum_x2],
+            [sum_x, sum_x2, sum_x3],
+            [sum_x2, sum_x3, sum_x4]
+        ]
+        m0 = [vector_b, m[1], m[2]]
+        m1 = [m[0], vector_b, m[2]]
+        m2 = [m[0], m[1], vector_b]
+        det_m = calc_determinant(m)
+        a0 = calc_determinant(m0) / det_m
+        a1 = calc_determinant(m1) / det_m
+        a2 = calc_determinant(m2) / det_m
+        return cls(a0, a1, a2)
 
 class TemperatureProbe:
     def __init__(self, config):
@@ -95,7 +120,6 @@ class TemperatureProbe:
         self.last_temp_read_time = 0.
         self.last_measurement = (0., 99999999., 0.,)
         # Calibration State
-        self._method = "manual"
         self.cal_helper = None
         self.next_auto_temp = 99999999.
         self.target_temp = 0
@@ -324,19 +348,7 @@ class TemperatureProbe:
     cmd_TEMPERATURE_PROBE_CALIBRATE_help = (
         "Calibrate probe temperature drift compensation"
     )
-    def _auto_probe(self, gcmd):
-        fo_params = dict(gcmd.get_command_parameters())
-        fo_params['METHOD'] = self._method
-        gcode = self.printer.lookup_object('gcode')
-        fo_gcmd = gcode.create_gcode_command("PROBE", "PROBE", fo_params)
-        pprobe = self.printer.lookup_object("probe")
-        probe_session = pprobe.start_probe_session(fo_gcmd)
-        probe_session.run_probe(fo_gcmd)
-        pos = probe_session.pull_probed_results()[0]
-        probe_session.end_probe_session()
-        self._manual_probe_finalize(pos)
     def cmd_TEMPERATURE_PROBE_CALIBRATE(self, gcmd):
-        self._method = gcmd.get('METHOD', 'manual').lower()
         if self.cal_helper is None:
             raise gcmd.error(
                 "No calibration helper registered for [%s]"
@@ -399,9 +411,6 @@ class TemperatureProbe:
         # Capture start position and begin initial probe
         toolhead = self.printer.lookup_object("toolhead")
         self.start_pos = toolhead.get_position()[:2]
-        if self._method == "tap":
-            self._auto_probe(gcmd)
-            return
         manual_probe.ManualProbeHelper(
             self.printer, gcmd, self._manual_probe_finalize
         )
@@ -424,9 +433,6 @@ class TemperatureProbe:
         curpos[2] = start_z
         toolhead.manual_move(curpos, probe_speed)
         self.gcode.register_command("ABORT", None)
-        if self._method == "tap":
-            self._auto_probe(gcmd)
-            return
         manual_probe.ManualProbeHelper(
             self.printer, gcmd, self._manual_probe_finalize
         )
