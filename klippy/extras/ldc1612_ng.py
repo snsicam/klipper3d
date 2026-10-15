@@ -291,7 +291,11 @@ class LDC1612_ng:
 
     def read_reg(self, reg):
         params = self._i2c.i2c_read([reg], 2)
-        response = bytearray(params["response"])
+        response = params.get("response") if params else None
+        if response is None:
+            raise self._i2c.get_mcu().get_printer().command_error(
+                "ldc1612: i2c read of register 0x%x returned no data" % (reg,))
+        response = bytearray(response)
         return (response[0] << 8) | response[1]
 
     def set_reg(self, reg, val, minclock=0):

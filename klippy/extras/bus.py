@@ -6,6 +6,10 @@
 import mcu
 import logging
 
+# Number of attempts for an i2c transfer before giving up on a bus error
+# (transient NACKs are common with noisy wiring or busy sensors)
+I2C_BUS_MAX_RETRIES = 10
+
 def resolve_bus_name(mcu, param, bus):
     # Find enumerations for the given bus
     enumerations = mcu.get_enumerations()
@@ -290,14 +294,21 @@ class MCU_I2C:
             cmd.send([self.oid, write, read_len],
                      minclock=minclock, reqclock=reqclock)
             return
-        param = cmd.send([self.oid, write, read_len],
-                         minclock=minclock, reqclock=reqclock, retry=retry)
-        status = param["i2c_bus_status"]
-        if status == "SUCCESS":
-            return param
-        err_msg = "MCU '%s' I2C request to addr %i reports error %s" % (
-            self.mcu.get_name(), self.i2c_address, status)
-        self.mcu.get_printer().invoke_shutdown(err_msg)
+        err_msg = None
+        for attempt in range(I2C_BUS_MAX_RETRIES):
+            param = cmd.send([self.oid, write, read_len],
+                             minclock=minclock, reqclock=reqclock, retry=retry)
+            status = param["i2c_bus_status"]
+            if status == "SUCCESS":
+                return param
+            err_msg = "MCU '%s' I2C request to addr %i reports error %s" % (
+                self.mcu.get_name(), self.i2c_address, status)
+            logging.warning("I2C bus error (attempt %d/%d): %s"
+                            % (attempt + 1, I2C_BUS_MAX_RETRIES, err_msg))
+        # A persistent bus error is raised to the caller (instead of
+        # shutting the printer down) so gcode handlers can report it
+        # gracefully
+        raise self.mcu.get_printer().command_error(err_msg)
 
 def MCU_I2C_from_config(config, default_addr=None, default_speed=100000,
                         async_write_only=False):

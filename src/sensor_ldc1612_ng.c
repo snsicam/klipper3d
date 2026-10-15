@@ -53,6 +53,10 @@ enum
 // Number of bytes in each ldc1612 sample. Always 4.
 #define BYTES_PER_SAMPLE 4
 
+// Consecutive i2c errors tolerated before giving up and shutting down
+// (a transient NACK on a noisy bus shouldn't kill the printer)
+#define LDC_I2C_MAX_CONSECUTIVE_ERRS 16
+
 // should match ldc1612_ng.py
 #define HOME_MODE_NONE 0
 #define HOME_MODE_HOME 1
@@ -193,6 +197,9 @@ struct ldc1612_ng
     uint16_t last_status;
     uint32_t last_read_value;
 
+    // Consecutive i2c read errors seen
+    uint8_t i2c_err_count;
+
     // Samples per second (configurable)
     uint32_t data_rate;
 
@@ -214,7 +221,7 @@ struct ldc1612_ng
 
 void command_config_ldc1612_ng(uint32_t *args);
 
-static void read_reg(struct ldc1612_ng *ld, uint8_t reg, uint8_t *res);
+static int read_reg(struct ldc1612_ng *ld, uint8_t reg, uint8_t *res);
 static uint16_t read_reg_status(struct ldc1612_ng *ld);
 
 static uint_fast8_t ldc1612_ng_timer_event(struct timer *timer);
@@ -271,19 +278,35 @@ ldc1612_ng_timer_event(struct timer *timer)
     return SF_RESCHEDULE;
 }
 
-// Read a register on the ldc1612
-void read_reg(struct ldc1612_ng *ld, uint8_t reg, uint8_t *res)
+// Read a register on the ldc1612; returns 0 on success, or an
+// I2C_BUS_* error code. Callers decide how to handle transient errors.
+int read_reg(struct ldc1612_ng *ld, uint8_t reg, uint8_t *res)
 {
-    int ret = i2c_dev_read(ld->i2c, sizeof(reg), &reg, 2, res);
-    i2c_shutdown_on_err(ret);
+    return i2c_dev_read(ld->i2c, sizeof(reg), &reg, 2, res);
 }
 
-// Read the status register on the ldc1612
+// Track consecutive i2c failures; once they exceed the threshold the
+// chip is presumed gone and we shut down
+static void
+note_i2c_error(struct ldc1612_ng *ld, int ret)
+{
+    if (++ld->i2c_err_count > LDC_I2C_MAX_CONSECUTIVE_ERRS)
+        i2c_shutdown_on_err(ret);
+}
+
+// Read the status register on the ldc1612. Returns 0 on an i2c error
+// (a transient failure simply looks like "no sample ready").
 uint16_t
 read_reg_status(struct ldc1612_ng *ld)
 {
     uint8_t data_status[2];
-    read_reg(ld, REG_STATUS, data_status);
+    int ret = read_reg(ld, REG_STATUS, data_status);
+    if (ret)
+    {
+        note_i2c_error(ld, ret);
+        return 0;
+    }
+    ld->i2c_err_count = 0;
     ld->last_status = (data_status[0] << 8) | data_status[1];
     return ld->last_status;
 }
@@ -399,15 +422,20 @@ void command_query_ldc1612_ng_latched_status(uint32_t *args)
     uint32_t lastval = ld->last_read_value;
 
     // If we're not actively running, then read the status and
-    // value directly
+    // value directly. Tolerate transient i2c errors by reporting
+    // the last known values.
     if (ld->rest_ticks == 0)
     {
         status = read_reg_status(ld);
         uint8_t d[4];
-        read_reg(ld, REG_DATA0_MSB, &d[0]);
-        read_reg(ld, REG_DATA0_LSB, &d[2]);
-
-        lastval = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | ((uint32_t)d[3]);
+        int ret = read_reg(ld, REG_DATA0_MSB, &d[0]);
+        if (!ret)
+            ret = read_reg(ld, REG_DATA0_LSB, &d[2]);
+        if (!ret)
+        {
+            ld->i2c_err_count = 0;
+            lastval = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | ((uint32_t)d[3]);
+        }
     }
 
     sendf("ldc1612_ng_latched_status oid=%c status=%u lastval=%u", args[0], status, lastval);
@@ -599,10 +627,24 @@ void ldc1612_ng_update(struct ldc1612_ng *ld, uint8_t oid)
 
     uint32_t time = timer_read_time();
 
-    // Read coil0 frequency
-    uint8_t *d = &ld->sb.data[ld->sb.data_count];
-    read_reg(ld, REG_DATA0_MSB, &d[0]);
-    read_reg(ld, REG_DATA0_LSB, &d[2]);
+    // Read coil0 frequency; on a transient i2c error skip this sample
+    // instead of storing garbage in the bulk data stream
+    uint8_t d[4];
+    int ret = read_reg(ld, REG_DATA0_MSB, &d[0]);
+    if (!ret)
+        ret = read_reg(ld, REG_DATA0_LSB, &d[2]);
+    if (ret)
+    {
+        note_i2c_error(ld, ret);
+        return;
+    }
+    ld->i2c_err_count = 0;
+
+    uint8_t *b = &ld->sb.data[ld->sb.data_count];
+    b[0] = d[0];
+    b[1] = d[1];
+    b[2] = d[2];
+    b[3] = d[3];
     ld->sb.data_count += BYTES_PER_SAMPLE;
 
     uint32_t data = ((uint32_t)d[0] << 24) | ((uint32_t)d[1] << 16) | ((uint32_t)d[2] << 8) | ((uint32_t)d[3]);
