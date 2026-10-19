@@ -30,16 +30,11 @@ class HomingOverride:
                 no_axis = False
                 break
 
-        if no_axis:
-            override = True
-        else:
-            # check if we home an axis which needs the override
-            override = False
-            for axis in self.axes:
-                if gcmd.get(axis, None) is not None:
-                    override = True
-
-        if not override:
+        # Only trigger the override when G28 is called without any axis
+        # parameters (full homing). Partial homing like "G28 X" or
+        # "G28 Z0" should run the real G28 directly — users expect those
+        # to home only the specified axis, not the full override chain.
+        if not no_axis:
             self.prev_G28(gcmd)
             return
 
