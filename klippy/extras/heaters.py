@@ -345,6 +345,18 @@ class PrinterHeaters:
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
+    def _check_temp_wait_interrupt(self):
+        # A host pause/cancel request is signaled via
+        # virtual_sdcard.must_pause_work, which pause_resume sets *before*
+        # taking the gcode lock.  Abort the wait here so the request is not
+        # stuck behind this blocking command.  Only do this for a wait that is
+        # being dispatched from the SD file - must_pause_work also stays set
+        # while a print is merely paused, and must not break manual waits.
+        v_sd = self.printer.lookup_object('virtual_sdcard', None)
+        if (v_sd is not None and v_sd.must_pause_work
+                and v_sd.is_cmd_from_sd()):
+            raise self.printer.command_error(
+                "Temperature wait interrupted by pause/cancel request")
     def _wait_for_temperature(self, heater):
         # Helper to wait on heater.check_busy() and report M105 temperatures
         if self.printer.get_start_args().get('debugoutput') is not None:
@@ -354,6 +366,7 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+            self._check_temp_wait_interrupt()
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
@@ -381,6 +394,7 @@ class PrinterHeaters:
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
+            self._check_temp_wait_interrupt()
             temp, target = sensor.get_temp(eventtime)
             if temp >= min_temp and temp <= max_temp:
                 return

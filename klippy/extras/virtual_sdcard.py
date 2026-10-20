@@ -3,7 +3,7 @@
 # Copyright (C) 2018-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, sys, logging, io
+import os, sys, logging, io, re
 
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
 
@@ -30,6 +30,8 @@ class VirtualSD:
         self.work_timer = None
         # Error handling
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        aio = self.printer.load_object(config, 'aio_executor')
+        self.executor = aio.allocate_executor("virtual_sdcard")
         self.on_error_gcode = gcode_macro.load_template(
             config, 'on_error_gcode', DEFAULT_ERROR_GCODE)
         # Register commands
@@ -113,9 +115,16 @@ class VirtualSD:
             self.must_pause_work = True
             while self.work_timer is not None and not self.cmd_from_sd:
                 self.reactor.pause(self.reactor.monotonic() + .001)
+        else:
+            # Defensive: if the work handler has already exited (e.g. due to
+            # an interrupt from a blocking temperature wait), make sure the
+            # pause flag is cleared so a subsequent resume sees a clean state.
+            self.must_pause_work = False
     def do_resume(self):
         if self.work_timer is not None:
             raise self.gcode.error("SD busy")
+        if self.current_file is None:
+            raise self.gcode.error("No SD file loaded")
         self.must_pause_work = False
         self.work_timer = self.reactor.register_timer(
             self.work_handler, self.reactor.NOW)
@@ -183,7 +192,10 @@ class VirtualSD:
             if fname not in flist:
                 fname = files_by_lower[fname.lower()]
             fname = os.path.join(self.sdcard_dirname, fname)
-            f = io.open(fname, 'r', newline='')
+            f = self.executor.submit(io.open, fname, 'rb', buffering=0)
+            f = self.executor.wrap_obj(f)
+            f = io.BufferedReader(f)
+            f = io.TextIOWrapper(f, newline='')
             f.seek(0, os.SEEK_END)
             fsize = f.tell()
             f.seek(0)
@@ -196,6 +208,43 @@ class VirtualSD:
         self.file_position = 0
         self.file_size = fsize
         self.print_stats.set_current_file(filename)
+
+        # Preheat: scan gcode header for M104/M109 and preset extruder
+        # temperature. This gives the heater advance time so that when
+        # work_handler starts reading gcode lines, the extruder is close
+        # to target temp already. Without this, M104 in the gcode file is
+        # only processed inside work_handler — too late for the first E
+        # move which triggers "Extrude below minimum temp".
+        try:
+            toolhead = self.printer.lookup_object('toolhead')
+            extruder = toolhead.get_extruder()
+            if extruder is not None:
+                heater = extruder.get_heater()
+                if heater is not None:
+                    st = heater.get_status(self.reactor.monotonic())
+                    if st.get('target', 0) <= 0:
+                        for _ in range(100):
+                            line = f.readline()
+                            if not line:
+                                break
+                            m = re.match(
+                                r'^\s*[Mm]10[49]\s+.*?[Ss](\d+\.?\d*)', line)
+                            if m:
+                                t = float(m.group(1))
+                                if 0 < t < 300:
+                                    heater.set_temp(t)
+                                    logging.info(
+                                        "SD print preheat: preset "
+                                        "extruder %.1fC from gcode", t)
+                                    break
+            f.seek(0)
+        except Exception:
+            logging.exception("virtual_sdcard preheat")
+            try:
+                f.seek(0)
+            except Exception:
+                pass
+
         self.printer.send_event("virtual_sdcard:load_file")
     def cmd_M24(self, gcmd):
         # Start/resume SD print
@@ -222,51 +271,25 @@ class VirtualSD:
         self.next_file_position = pos
     def is_cmd_from_sd(self):
         return self.cmd_from_sd
-    
-    def _check_and_set_extruder_temperature(self):
-        """Check extruder temperature and set default 220??C if not set"""
-        try:
-            # Get the toolhead and extruder
-            toolhead = self.printer.lookup_object('toolhead')
-            extruder = toolhead.get_extruder()
-            
-            if extruder is None:
-                logging.info("No extruder configured, skipping temperature check")
-                return
-            
-            # Get heater from extruder
-            heater = extruder.get_heater()
-            
-            if heater is None:
-                logging.info("No heater configured for extruder, skipping temperature check")
-                return
-            
-            # Get current temperature status
-            eventtime = self.reactor.monotonic()
-            status = heater.get_status(eventtime)
-            target_temp = status.get('target', 0)
-            
-            # Check if target temperature is set (greater than 0)
-            if target_temp <= 0:
-                logging.info("Extruder temperature not set, setting default temperature to 220??C")
-                # Set default temperature of 220??C
-                pheaters = self.printer.lookup_object('heaters')
-                pheaters.set_temperature(heater, 220.0, wait=False)
-                logging.info("Default extruder temperature 220??C set successfully")
-            else:
-                logging.info("Extruder temperature already set to %.1f??C", target_temp)
-                
-        except Exception as e:
-            logging.exception("Error checking/setting extruder temperature: %s", str(e))
-    
     # Background work timer
     def work_handler(self, eventtime):
         logging.info("Starting SD card print (position %d)", self.file_position)
         self.reactor.unregister_timer(self.work_timer)
-        
-        # Check and set default extruder temperature if not set
-        self._check_and_set_extruder_temperature()
-        
+        # Keep self.work_timer as-is (stale, unregistered) for the whole print.
+        # is_active() is defined as "work_timer is not None", so clearing it
+        # here would make is_active() return False during the print - which
+        # breaks pause_resume: _request_sd_interrupt() would silently do
+        # nothing (must_pause_work never set, so a blocking temperature wait
+        # is never interrupted) and send_pause_command() would emit a fake
+        # "action:paused" without stopping the SD print.
+        # Guard: if current_file was cleared while we were waiting for the
+        # gcode mutex (e.g. by a _reset_file or do_cancel in another macro),
+        # bail out cleanly instead of crashing on seek.
+        if self.current_file is None:
+            logging.info("SD card print aborted: current_file is None")
+            self.work_timer = None
+            self.must_pause_work = False
+            return self.reactor.NEVER
         try:
             self.current_file.seek(self.file_position)
         except:
@@ -274,6 +297,11 @@ class VirtualSD:
             self.work_timer = None
             return self.reactor.NEVER
         self.print_stats.note_start()
+
+        # Preheating is handled in _load_file (see that function).
+        # Do NOT add reactor-blocking wait here — it freezes the reactor
+        # and breaks HTTP/Moonraker communication.
+
         gcode_mutex = self.gcode.get_mutex()
         partial_input = ""
         lines = []
@@ -303,6 +331,17 @@ class VirtualSD:
             if gcode_mutex.test():
                 self.reactor.pause(self.reactor.monotonic() + 0.050)
                 continue
+            # Yield to reactor so host pause/cancel webhook requests get a
+            # chance to run and set must_pause_work BEFORE we take the mutex
+            # and potentially block on a long-running command (G28,
+            # START_PRINT macro, TEMPERATURE_WAIT, etc.).  Without this, a
+            # PAUSE/CANCEL fired during any blocking command that is NOT a
+            # heater wait would be stuck behind the gcode mutex until that
+            # command finishes (see heaters._check_temp_wait_interrupt for
+            # the heater-specific path that also needs this generic fallback).
+            self.reactor.pause(self.reactor.NOW)
+            if self.must_pause_work:
+                continue
             # Dispatch command
             self.cmd_from_sd = True
             line = lines.pop()
@@ -314,6 +353,13 @@ class VirtualSD:
             try:
                 self.gcode.run_script(line)
             except self.gcode.error as e:
+                if self.must_pause_work:
+                    # A host pause/cancel request interrupted this command
+                    # (e.g. a blocking temperature wait).  Leave the line
+                    # unconsumed so it is retried on resume; the queued
+                    # PAUSE/CANCEL_PRINT request now runs.
+                    logging.info("SD card print interrupted by host request")
+                    break
                 error_message = str(e)
                 try:
                     self.gcode.run_script(self.on_error_gcode.render())

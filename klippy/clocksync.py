@@ -111,7 +111,10 @@ class ClockSync:
         self.clock_covariance = (1. - DECAY) * (
             self.clock_covariance + diff_sent_time * diff_clock * DECAY)
         # Update prediction from linear regression
-        new_freq = self.clock_covariance / self.time_variance
+        if self.time_variance > 1e-30:
+            new_freq = self.clock_covariance / self.time_variance
+        else:
+            new_freq = self.mcu_freq
         pred_stddev = math.sqrt(self.prediction_variance)
         self.serial.set_clock_est(new_freq, self.time_avg + TRANSMIT_EXTRA,
                                   int(self.clock_avg - 3. * pred_stddev), clock)
