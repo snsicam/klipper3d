@@ -271,6 +271,45 @@ class VirtualSD:
         self.next_file_position = pos
     def is_cmd_from_sd(self):
         return self.cmd_from_sd
+    def _wait_extruder_ready(self):
+        # Wait (without holding the gcode mutex) until the extruder becomes
+        # extrude-capable.  Returns False when the extruder is not heating
+        # (genuine cold extrude - abort), when a host pause/cancel request
+        # arrives (must_pause_work), when the heater is turned off, or when
+        # the wait exceeds 10 minutes.  The failing line stays unconsumed in
+        # every False path, so a pause/resume cycle naturally retries it.
+        reactor = self.reactor
+        toolhead = self.printer.lookup_object('toolhead')
+        extruder = toolhead.get_extruder()
+        if extruder is None:
+            return False
+        heater = extruder.get_heater()
+        if heater is None:
+            return False
+        st = heater.get_status(reactor.monotonic())
+        if st.get('target', 0) <= 0:
+            return False
+        logging.info(
+            "SD print: extruder below min_extrude_temp (%.1fC), waiting to "
+            "reach target %.1fC before retrying",
+            heater.min_extrude_temp, st['target'])
+        deadline = reactor.monotonic() + 600.
+        while not self.must_pause_work:
+            st = heater.get_status(reactor.monotonic())
+            if heater.can_extrude:
+                return True
+            if st.get('target', 0) <= 0:
+                logging.error(
+                    "SD print: extruder heater turned off during "
+                    "cold-extrude wait, aborting")
+                return False
+            if reactor.monotonic() >= deadline:
+                logging.error(
+                    "SD print: extruder still below min_extrude_temp after "
+                    "600s, aborting cold-extrude wait")
+                return False
+            reactor.pause(reactor.monotonic() + 0.5)
+        return False
     # Background work timer
     def work_handler(self, eventtime):
         logging.info("Starting SD card print (position %d)", self.file_position)
@@ -358,6 +397,25 @@ class VirtualSD:
                     # (e.g. a blocking temperature wait).  Leave the line
                     # unconsumed so it is retried on resume; the queued
                     # PAUSE/CANCEL_PRINT request now runs.
+                    logging.info("SD card print interrupted by host request")
+                    break
+                # Cold-extrude guard: cloud-sliced gcode (FlashForge) issues
+                # E moves right after an async M104 with no M109 wait, so the
+                # first extrusion can fire while the nozzle is still heating
+                # (bed-only M190 passed instantly, or heaters had been turned
+                # off by a previous cancel).  If the extruder is actively
+                # heating toward a target, wait for it to become extrude-
+                # capable and retry the line instead of aborting the print
+                # through on_error_gcode (device config: CANCEL_PRINT).
+                if (str(e).startswith("Extrude below minimum temp")
+                        and self._wait_extruder_ready()):
+                    lines.append(line)  # retry the unconsumed line
+                    self.cmd_from_sd = False
+                    continue
+                if self.must_pause_work:
+                    # The cold-extrude wait above was interrupted by a host
+                    # pause/cancel request - same handling as the interrupt
+                    # path: the queued PAUSE/CANCEL_PRINT request now runs.
                     logging.info("SD card print interrupted by host request")
                     break
                 error_message = str(e)
