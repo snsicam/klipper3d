@@ -18,7 +18,8 @@ dirs-$(CONFIG_MACH_STM32L4) += lib/stm32l4
 MCU := $(shell echo $(CONFIG_MCU))
 MCU_UPPER := $(shell echo $(CONFIG_MCU) | tr a-z A-Z | tr X x)
 
-CFLAGS-$(CONFIG_HAVE_LIMITED_CODE_SIZE) += -Os
+# CFLAGS-$(CONFIG_HAVE_LIMITED_CODE_SIZE) += -Os
+# fork 补丁：Optional features 菜单可见性不再联动 -Os，保持 Makefile 默认的 -O2
 CFLAGS-$(CONFIG_MACH_STM32F0) += -mcpu=cortex-m0 -Ilib/stm32f0/include
 CFLAGS-$(CONFIG_MACH_STM32F103) += -mcpu=cortex-m3
 CFLAGS-$(CONFIG_MACH_N32G45x) += -mcpu=cortex-m4 -Ilib/n32g45x/include
@@ -96,6 +97,8 @@ target-y += $(OUT)klipper.bin $(OUT)klipper.hex
 $(OUT)klipper.bin: $(OUT)klipper.elf
 	@echo "  Creating bin file $@"
 	$(Q)$(OBJCOPY) -O binary $< $@
+	$(Q)size=$$(stat -c %s $@); flash=$$(printf '%d' $(CONFIG_FLASH_SIZE)); \
+	echo "  Bin size: $$size bytes ($$((size * 100 / flash))% of flash)"
 
 $(OUT)klipper.hex: $(OUT)klipper.elf
 	@echo "  Creating hex file $@"

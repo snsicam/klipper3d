@@ -19,6 +19,7 @@ OBJCOPY=$(CROSS_PREFIX)objcopy
 OBJDUMP=$(CROSS_PREFIX)objdump
 STRIP=$(CROSS_PREFIX)strip
 CPP=$(CROSS_PREFIX)cpp
+SIZE=$(CROSS_PREFIX)size
 PYTHON=python3
 
 # Show build tools info (always displayed)
@@ -85,6 +86,7 @@ $(OUT)klipper.elf: $(OBJS_klipper.elf)
 	@echo "  Linking $@"
 	$(Q)$(CC) $(OBJS_klipper.elf) $(CFLAGS_klipper.elf) -o $@
 	$(Q)scripts/check-gcc.sh $@ $(OUT)compile_time_request.o
+	$(Q)$(SIZE) $@
 
 ################ Compile time requests
 
